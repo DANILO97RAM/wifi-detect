@@ -1,0 +1,1 @@
+"""Persistent device storage."""

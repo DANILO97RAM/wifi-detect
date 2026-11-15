@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Wi-Fi Monitor</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+  header { display: flex; gap: 1rem; align-items: center; padding: 1rem 1.5rem; background: #1e293b; }
+  h1 { font-size: 1.2rem; margin: 0; flex: 1; }
+  select, button, input { background: #334155; color: inherit; border: 1px solid #475569; border-radius: 6px; padding: .4rem .7rem; }
+  main { padding: 1.5rem; }
+  .count { display: inline-block; background: #22c55e; color: #052e16; font-weight: 700; border-radius: 999px; padding: .3rem .9rem; }
+  .muted { color: #94a3b8; font-size: .85rem; margin-left: .5rem; }
+  #alerts .alert { background: #b45309; padding: .6rem 1rem; border-radius: 6px; margin-bottom: .5rem; }
+  #error { color: #fca5a5; margin: .5rem 0; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  th, td { text-align: left; padding: .55rem .7rem; border-bottom: 1px solid #334155; }
+  th { color: #94a3b8; font-weight: 500; }
+  .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; margin-right: .4rem; }
+  .on { background: #22c55e; } .off { background: #64748b; }
+  code { font-size: .9rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Wi-Fi Monitor</h1>
+  <select id="network"></select>
+  <button id="scan">Scan now</button>
+</header>
+<main>
+  <div id="alerts"></div>
+  <div>Connected devices: <span class="count" id="online">0</span>
+    <span class="muted" id="total"></span></div>
+  <div id="error"></div>
+  <table>
+    <thead><tr><th>Status</th><th>Name</th><th>MAC</th><th>IP</th><th>Vendor</th><th>Type</th><th>Hostname</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+let editing = false;
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error(path + " " + r.status);
+  return r.json();
+}
+
+async function loadNetworks() {
+  const nets = await api("/api/networks");
+  $("network").innerHTML = nets.map(n => `<option value="${esc(n.id)}">${esc(n.name)} (${esc(n.provider)})</option>`).join("");
+}
+
+async function refresh() {
+  const id = $("network").value;
+  if (!id || editing) return;
+  const [sum, devs, alerts] = await Promise.all([
+    api(`/api/networks/${id}/summary`), api(`/api/networks/${id}/devices`), api("/api/alerts")]);
+  $("online").textContent = sum.online;
+  $("total").textContent = `of ${sum.total} known`;
+  $("error").textContent = sum.error ? "Scan error: " + sum.error : "";
+  $("rows").innerHTML = devs.map(d => `<tr>
+    <td><span class="dot ${d.online ? "on" : "off"}"></span>${d.online ? "Online" : "Offline"}</td>
+    <td><input data-mac="${esc(d.mac)}" value="${esc(d.name)}" placeholder="Set name"></td>
+    <td><code>${esc(d.mac)}</code></td><td>${esc(d.ip)}</td><td>${esc(d.vendor)}</td>
+    <td>${esc(d.type)}</td><td>${esc(d.hostname)}</td></tr>`).join("");
+  $("alerts").innerHTML = alerts.length
+    ? alerts.map(a => `<div class="alert">${esc(a.message)}</div>`).join("") +
+      `<button onclick="ack()">Dismiss alerts</button>` : "";
+}
+
+async function ack() { await api("/api/alerts/ack", {method: "POST"}); refresh(); }
+
+$("rows").addEventListener("focusin", () => editing = true);
+$("rows").addEventListener("focusout", () => editing = false);
+$("rows").addEventListener("change", async e => {
+  const id = $("network").value;
+  await api(`/api/networks/${id}/devices/${encodeURIComponent(e.target.dataset.mac)}`, {
+    method: "PATCH", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({name: e.target.value})});
+});
+$("network").addEventListener("change", refresh);
+$("scan").addEventListener("click", async () => {
+  $("scan").disabled = true;
+  try { await api(`/api/networks/${$("network").value}/scan`, {method: "POST"}); await refresh(); }
+  finally { $("scan").disabled = false; }
+});
+
+loadNetworks().then(refresh);
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

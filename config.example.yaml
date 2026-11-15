@@ -1,0 +1,14 @@
+poll_interval: 30
+db_path: wifi-monitor.db
+host: 127.0.0.1
+port: 8000
+
+# Update subnet and interface_index for your Windows Wi-Fi adapter.
+# Available providers: arp | tplink | dlink | starlink | windows
+networks:
+  - id: starlink
+    name: My Wi-Fi
+    provider: windows
+    subnet: 192.168.1.0/24
+    options:
+      interface_index: 17
