@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from wifi_monitor.core.models import normalize_mac
+from wifi_monitor.services.enrichment import enrich
 
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
@@ -35,7 +36,7 @@ def create_app(config, storage, scanner) -> FastAPI:
     @app.get("/api/networks/{network_id}/devices")
     def devices(network_id: str):
         get_network(network_id)
-        return [d.to_dict() for d in storage.list_devices(network_id)]
+        return [enrich(d).to_dict() for d in storage.list_devices(network_id)]
 
     @app.get("/api/networks/{network_id}/summary")
     def summary(network_id: str):

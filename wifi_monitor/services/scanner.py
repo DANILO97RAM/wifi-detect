@@ -19,7 +19,11 @@ class Scanner:
 
     def scan_network(self, network):
         try:
-            devices = [enrich(d) for d in create_provider(network).scan()]
+            names = {d.mac: d.name for d in self.storage.list_devices(network.id)}
+            devices = []
+            for device in create_provider(network).scan():
+                device.name = names.get(device.mac, "")
+                devices.append(enrich(device))
         except Exception as exc:  # keep the loop alive on provider failures
             self.errors[network.id] = str(exc)
             log.error("scan failed for %s: %s", network.id, exc)

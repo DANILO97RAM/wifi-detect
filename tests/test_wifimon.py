@@ -1,19 +1,23 @@
 import ipaddress
+import io
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
-from wifi_monitor.services.enrichment import classify, lookup_vendor
+from wifi_monitor.services import enrichment
+from wifi_monitor.services.enrichment import classify, enrich, lookup_vendor
 from wifi_monitor.core.models import Device
 from wifi_monitor.providers.discovery import RouterHttpProvider
 from wifi_monitor.core.config import NetworkConfig, load_config
 from wifi_monitor.storage.repository import Storage
 from wifi_monitor.providers.windows import parse_neighbours, scan_windows
+from wifi_monitor.services.scanner import Scanner
 
 
 def test_vendor_and_randomized():
-    assert lookup_vendor("b8:27:eb:00:00:01") == "Raspberry Pi"
+    assert lookup_vendor("b8:27:eb:00:00:01").startswith("Raspberry Pi")
     assert lookup_vendor("da:a1:19:00:00:01").startswith("Private")
 
 
@@ -110,22 +114,140 @@ def test_database_path_is_relative_to_config_not_working_directory(tmp_path, mon
 
 
 def test_launcher_uses_existing_config_from_another_directory(tmp_path, monkeypatch):
-    import wifimon_main
+    import FLDSMDFR as launcher
 
     installation = tmp_path / "installation"
     installation.mkdir()
     (installation / "config.yaml").write_text("networks: []\n")
     captured = {}
-    monkeypatch.setattr(wifimon_main, "PROJECT_ROOT", installation)
-    monkeypatch.setattr(wifimon_main.sys, "argv", ["wifimon_main.py"])
+    monkeypatch.setattr(launcher, "PROJECT_ROOT", installation)
+    monkeypatch.setattr(launcher.sys, "argv", ["FLDSMDFR.py"])
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(wifimon_main.Scanner, "start", lambda self: None)
-    monkeypatch.setattr(wifimon_main, "create_app", lambda config, storage, scanner: storage)
+    monkeypatch.setattr(launcher.Scanner, "start", lambda self: None)
+    monkeypatch.setattr(launcher, "create_app", lambda config, storage, scanner: storage)
 
     def run(storage, **kwargs):
         captured["db_path"] = storage.conn.execute("PRAGMA database_list").fetchone()["file"]
         storage.conn.close()
 
-    monkeypatch.setattr(wifimon_main.uvicorn, "run", run)
-    wifimon_main.main()
+    monkeypatch.setattr(launcher.uvicorn, "run", run)
+    launcher.main()
     assert captured["db_path"] == str(installation / "wifi-monitor.db")
+
+
+@pytest.mark.parametrize("vendor,label,expected", [
+    ("Samsung Electronics Co.,Ltd", "Samsung S24", "Phone"),
+    ("Private (locally administered MAC)", "Samsung A36", "Phone"),
+    ("Samsung Electronics Co.,Ltd", "Samsung TV sala", "TV"),
+    ("Samsung Electronics Co.,Ltd", "Galaxy-Tab", "Tablet"),
+    ("LG Electronics", "LG_webOS", "TV"),
+    ("Sony Corporation", "BRAVIA living room", "TV"),
+    ("Amazon Technologies Inc.", "Fire-TV", "Streaming device"),
+    ("Google, Inc.", "Chromecast TV", "Streaming device"),
+    ("Intel Corporate", "PC HP", "Computer"),
+    ("Unknown", "PC MSI", "Computer"),
+    ("Unknown", "Leidy Router", "Network gear"),
+    ("Unknown", "Nintendo Switch", "Game console"),
+    ("Unknown", "Ethernet switch", "Network gear"),
+    ("Unknown", "HP LaserJet", "Printer"),
+    ("Unknown", "Moto G84", "Phone"),
+    ("Unknown", "nest-mini", "Smart speaker"),
+    ("Unknown", "Cameron", "Unknown"),
+    ("Unknown", "Darwin", "Unknown"),
+])
+def test_specific_device_identifiers_and_word_boundaries(vendor, label, expected):
+    assert classify(vendor, label) == expected
+
+
+@pytest.mark.parametrize("vendor,expected", [
+    ("Samsung Electronics Co.,Ltd", "Samsung device"),
+    ("Intel Corporate", "Computer / network adapter"),
+    ("Micro-Star INT'L CO., LTD.", "Computer"),
+    ("D-Link International", "Network gear"),
+    ("TP-Link Systems Inc.", "Network gear"),
+    ("Space Exploration Technologies", "Network gear"),
+])
+def test_registry_vendor_names_do_not_imply_exact_models(vendor, expected):
+    assert classify(vendor, "") == expected
+
+
+def test_saved_name_overrides_hostname_and_private_mac_does_not_imply_phone():
+    mac = "da:a1:19:00:00:01"
+    assert classify("Private", "Galaxy-S24", mac, "TV sala") == "TV"
+    assert classify("Private", "", mac) == "Unknown"
+
+
+def test_load_ieee_registry_and_private_mac_precedence(tmp_path, monkeypatch):
+    registry = tmp_path / "oui.txt"
+    registry.write_text(
+        "00-11-22   (hex)   Samsung Electronics Co.,Ltd\n"
+        "02-11-22   (hex)   Example Corporation\n"
+        "INVALID   (hex)   Not a manufacturer\n",
+    )
+    monkeypatch.setattr(enrichment, "DEFAULT_OUI_FILE", registry)
+    monkeypatch.setattr(enrichment, "OUI", {})
+    enrichment._load_default_oui.cache_clear()
+    try:
+        assert lookup_vendor("00-11-22-AA-BB-CC") == "Samsung Electronics Co.,Ltd"
+        assert lookup_vendor("02:11:22:aa:bb:cc").startswith("Private")
+        assert classify(lookup_vendor("00:11:22:aa:bb:cc"), "Samsung TV") == "TV"
+    finally:
+        enrichment._load_default_oui.cache_clear()
+
+
+def test_failed_registry_update_preserves_existing_file(tmp_path, monkeypatch):
+    registry = tmp_path / "oui.txt"
+    registry.write_text("existing registry")
+    monkeypatch.setattr(enrichment, "DEFAULT_OUI_FILE", registry)
+    monkeypatch.setattr(enrichment, "urlopen", lambda url, timeout: io.BytesIO(b"<html>Error</html>"))
+    with pytest.raises(ValueError, match="no valid IEEE"):
+        enrichment.update_oui_file()
+    assert registry.read_text() == "existing registry"
+
+
+def test_registry_update_uses_only_public_url_and_loads_offline(tmp_path, monkeypatch):
+    registry = tmp_path / "data" / "oui.txt"
+    payload = b"00-11-22   (hex)   Example Corporation\n"
+    calls = []
+
+    def download(url, timeout):
+        calls.append(url)
+        return io.BytesIO(payload)
+
+    monkeypatch.setattr(enrichment, "DEFAULT_OUI_FILE", registry)
+    monkeypatch.setattr(enrichment, "OUI", {})
+    monkeypatch.setattr(enrichment, "urlopen", download)
+    enrichment._load_default_oui.cache_clear()
+    try:
+        assert enrichment.update_oui_file() == 1
+        assert registry.read_bytes() == payload
+        assert lookup_vendor("00:11:22:aa:bb:cc") == "Example Corporation"
+        assert calls == [enrichment.OUI_URL]
+        assert list(registry.parent.iterdir()) == [registry]
+    finally:
+        enrichment._load_default_oui.cache_clear()
+
+
+def test_scan_preserves_saved_names_and_estimates_type_from_them(monkeypatch):
+    storage = Storage(":memory:")
+    mac = "da:a1:19:00:00:01"
+    network = NetworkConfig("starlink", "Starlink", "windows")
+    config = SimpleNamespace(networks=[network], poll_interval=30)
+    provider = SimpleNamespace(scan=lambda: [Device(mac=mac)])
+    monkeypatch.setattr("wifi_monitor.services.scanner.create_provider", lambda network: provider)
+    scanner = Scanner(config, storage)
+    try:
+        storage.save_scan("starlink", [Device(mac=mac)])
+        storage.rename("starlink", mac, "Samsung A36")
+        scanner.scan_network(network)
+        device = storage.list_devices("starlink")[0]
+        assert (device.name, device.type) == ("Samsung A36", "Phone")
+        storage.rename("starlink", mac, "Samsung TV sala")
+        scanner.scan_network(network)
+        device = storage.list_devices("starlink")[0]
+        assert (device.name, device.type) == ("Samsung TV sala", "TV")
+        storage.rename("starlink", mac, "")
+        assert enrich(storage.list_devices("starlink")[0]).type == "Unknown"
+        assert not scanner.errors
+    finally:
+        storage.conn.close()

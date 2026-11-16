@@ -1,4 +1,4 @@
-"""Entry point: python wifimon_main.py [config.yaml]"""
+"""Entry point: python FLDSMDFR.py [config.yaml]"""
 import logging
 import sys
 from pathlib import Path

@@ -1,4 +1,17 @@
 """Vendor lookup (offline OUI table) and device-type enrichment."""
+import argparse
+from functools import lru_cache
+import logging
+from pathlib import Path
+import re
+import tempfile
+from urllib.error import URLError
+from urllib.request import urlopen
+
+from wifi_monitor.core.models import Device, normalize_mac
+
+OUI_URL = "https://standards-oui.ieee.org/oui/oui.txt"
+DEFAULT_OUI_FILE = Path(__file__).resolve().parents[2] / "data" / "oui.txt"
 
 # Small built-in OUI sample; extend or load a full IEEE oui.txt via load_oui_file().
 OUI = {
@@ -19,37 +32,102 @@ OUI = {
 }
 
 TYPE_RULES = [
-    (("iphone", "android", "galaxy", "pixel", "redmi", "oneplus"), "Phone"),
-    (("ipad", "tablet", "kindle"), "Tablet"),
-    (("macbook", "laptop", "desktop", "-pc", "win"), "Computer"),
-    (("tv", "roku", "chromecast", "firetv", "bravia"), "TV / Streaming"),
-    (("printer", "epson", "brother", "hp-", "canon"), "Printer"),
-    (("echo", "alexa", "nest", "sonos", "homepod"), "Smart speaker"),
-    (("cam", "ring", "doorbell"), "Camera"),
-    (("playstation", "xbox", "switch", "nintendo"), "Game console"),
+    (r"\b(ipad|tablet|kindle|galaxy\s+tab|surface\s+pro)\b", "Tablet"),
+    (r"\b(chromecast|roku|fire\s*tv|apple\s*tv|shield\s*tv)\b", "Streaming device"),
+    (r"\b(tv|televisor|television|smart\s*tv|bravia|webos|tizen)\b", "TV"),
+    (r"\b(iphone|android|galaxy|pixel|redmi|oneplus|smartphone|celular|telefono)\b"
+     r"|\b(samsung\s+[sazm]\s*\d{1,3}|moto\s+(g\d*|e\d*|edge)|poco\s+[fxm]\d+)\b", "Phone"),
+    (r"\b(printer|impresora|laserjet|deskjet|officejet|epson|brother|pixma)\b", "Printer"),
+    (r"\b(playstation|ps[345]|xbox|nintendo|steam\s*deck)\b", "Game console"),
+    (r"\b(router|mesh|switch|access\s*point|punto\s+de\s+acceso|deco|repeater|repetidor)\b",
+     "Network gear"),
+    (r"\b(echo|alexa|sonos|homepod|nest\s+(audio|mini))\b", "Smart speaker"),
+    (r"\b(camera|camara|cam|doorbell|tapo|wyze|reolink|ring\s+(camera|doorbell))\b", "Camera"),
+    (r"\b(macbook|imac|laptop|desktop|pc|windows|msi|thinkpad|ideapad|pavilion|omen|"
+     r"victus|elitebook|probook|computador|computadora|portatil)\b", "Computer"),
+    (r"\b(plug|enchufe|bulb|bombilla|thermostat|termostato|shelly|sonoff)\b", "Smart home"),
 ]
 
 VENDOR_TYPES = {
-    "Apple": "Phone / Apple device", "Samsung": "Phone / TV", "Google": "Google device",
+    "Apple": "Apple device", "Samsung": "Samsung device", "Google": "Google device",
     "Raspberry Pi": "Computer (SBC)", "Nest": "Smart home", "Amazon": "Smart speaker / Fire",
     "Sonos": "Smart speaker", "Brother": "Printer", "Epson": "Printer", "Seiko Epson": "Printer",
     "Kyocera": "Printer", "TP-Link": "Network gear", "D-Link": "Network gear",
     "VMware": "Virtual machine", "VirtualBox": "Virtual machine", "Microsoft": "Computer",
-    "Realtek": "Computer", "Giga-Byte": "Computer", "Nvidia": "Streaming / Computer",
+    "Realtek": "Network adapter", "Giga-Byte": "Computer", "Nvidia": "Streaming / Computer",
+    "Intel": "Computer / network adapter", "MSI": "Computer",
+    "HP": "Computer / Printer", "Dell": "Computer", "Lenovo": "Computer / Tablet",
+    "ASUS": "Computer / Network gear", "Acer": "Computer", "LG": "LG device",
+    "Sony": "Sony device", "Hisense": "Hisense device", "TCL": "TCL device",
+    "Vizio": "TV / other device", "Roku": "TV / Streaming",
+    "Xiaomi": "Xiaomi device", "Huawei": "Huawei device", "Motorola": "Motorola device",
+    "OnePlus": "Phone / other device", "Oppo": "Phone / other device",
+    "Vivo": "Phone / other device", "Realme": "Phone / other device",
+    "Espressif": "Smart home / IoT", "Tuya": "Smart home / IoT",
+    "Ubiquiti": "Network gear", "Netgear": "Network gear", "Linksys": "Network gear",
+    "MikroTik": "Network gear", "Tenda": "Network gear", "SpaceX": "Network gear",
+    "Canon": "Printer / Camera", "Hikvision": "Camera / Recorder", "Dahua": "Camera / Recorder",
 }
 
+VENDOR_RULES = [
+    (r"\btp[\s-]*link\b", "TP-Link"), (r"\bd[\s-]*link\b", "D-Link"),
+    (r"\bintel\b", "Intel"), (r"\bmicro[\s-]*star\b|\bmsi\b", "MSI"),
+    (r"\bhewlett[\s-]*packard\b|\bhp\b", "HP"), (r"\bgiga[\s-]*byte\b", "Giga-Byte"),
+    (r"\braspberry\s*pi\b", "Raspberry Pi"),
+    (r"\bspace\s+exploration\b|\bspacex\b", "SpaceX"),
+]
 
-def load_oui_file(path: str) -> None:
-    """Load lines like '00-1A-11   (hex)   Google' from the IEEE oui.txt."""
-    with open(path, encoding="utf-8", errors="ignore") as fh:
-        for line in fh:
-            if "(hex)" in line:
-                prefix, _, vendor = line.partition("(hex)")
-                OUI[prefix.strip().lower().replace("-", ":")] = vendor.strip()
+
+def parse_oui(text: str) -> dict[str, str]:
+    entries = {
+        normalize_mac(prefix): vendor.strip()
+        for prefix, vendor in re.findall(
+            r"^\s*([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){2})\s+\(hex\)\s+([^\r\n]+)",
+            text, re.MULTILINE,
+        )
+    }
+    if not entries:
+        raise ValueError("The OUI file contains no valid IEEE manufacturer entries")
+    return entries
+
+
+def load_oui_file(path: str | Path) -> None:
+    """Load the IEEE registry locally without transmitting device addresses."""
+    OUI.update(parse_oui(Path(path).read_text(encoding="utf-8-sig")))
+
+
+@lru_cache(maxsize=1)
+def _load_default_oui() -> None:
+    if DEFAULT_OUI_FILE.exists():
+        load_oui_file(DEFAULT_OUI_FILE)
+    else:
+        logging.getLogger("wifimon").warning(
+            "Using the limited built-in vendor table. Download the IEEE registry with "
+            "python -m wifi_monitor.services.enrichment --update-oui"
+        )
+
+
+def update_oui_file() -> int:
+    with urlopen(OUI_URL, timeout=60) as response:
+        text = response.read().decode("utf-8-sig")
+    entries = parse_oui(text)
+    DEFAULT_OUI_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=DEFAULT_OUI_FILE.parent, delete=False,
+    ) as output:
+        temporary = Path(output.name)
+        try:
+            output.write(text)
+            output.close()
+            temporary.replace(DEFAULT_OUI_FILE)
+        finally:
+            temporary.unlink(missing_ok=True)
+    OUI.update(entries)
+    return len(entries)
 
 
 def is_randomized(mac: str) -> bool:
-    """Locally administered bit set => private/random MAC (modern phones)."""
+    """A locally administered address may be randomized or configured manually."""
     try:
         return bool(int(mac.split(":")[0], 16) & 0b10)
     except ValueError:
@@ -57,25 +135,43 @@ def is_randomized(mac: str) -> bool:
 
 
 def lookup_vendor(mac: str) -> str:
-    vendor = OUI.get(mac.lower()[:8])
-    if vendor:
-        return vendor
-    return "Private (randomized MAC)" if is_randomized(mac) else "Unknown"
+    mac = normalize_mac(mac)
+    _load_default_oui()
+    if is_randomized(mac):
+        return "Private (locally administered MAC)"
+    return OUI.get(mac[:8], "Unknown")
 
 
-def classify(vendor: str, hostname: str, mac: str = "") -> str:
-    host = (hostname or "").lower()
-    for keywords, dev_type in TYPE_RULES:
-        if any(k in host for k in keywords):
+def classify(vendor: str, hostname: str, mac: str = "", name: str = "") -> str:
+    for label in (name, hostname):
+        text = re.sub(r"[_-]+", " ", (label or "").casefold())
+        for pattern, dev_type in TYPE_RULES:
+            if re.search(pattern, text):
+                return dev_type
+    if is_randomized(normalize_mac(mac)) or vendor.startswith("Private"):
+        return "Unknown"
+    for pattern, canonical in VENDOR_RULES:
+        if re.search(pattern, vendor, re.IGNORECASE):
+            return VENDOR_TYPES[canonical]
+    for canonical, dev_type in VENDOR_TYPES.items():
+        if re.search(r"\b" + re.escape(canonical) + r"\b", vendor, re.IGNORECASE):
             return dev_type
-    if vendor in VENDOR_TYPES:
-        return VENDOR_TYPES[vendor]
-    if vendor.startswith("Private"):
-        return "Phone / Tablet (private MAC)"
     return "Unknown"
 
 
-def enrich(device):
+def enrich(device: Device) -> Device:
     device.vendor = lookup_vendor(device.mac)
-    device.type = classify(device.vendor, device.hostname, device.mac)
+    device.type = classify(device.vendor, device.hostname, device.mac, device.name)
     return device
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Download the IEEE vendor registry for offline lookup")
+    parser.add_argument("--update-oui", action="store_true", required=True)
+    parser.parse_args()
+    try:
+        count = update_oui_file()
+    except (OSError, URLError, ValueError) as error:
+        parser.exit(1, f"Registry update failed: {error}\nThe existing registry was not replaced.\n")
+    print(f"Downloaded {count} manufacturer prefixes to {DEFAULT_OUI_FILE}")
+    print("Restart the app to load the updated registry.")

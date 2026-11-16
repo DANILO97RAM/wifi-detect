@@ -6,7 +6,7 @@ Free, self-hosted dashboard listing devices on your Wi-Fi: MAC, IP, vendor, devi
 ```
 cp config.example.yaml config.yaml    # first setup only; keep existing config
 pip install -r requirements.txt
-python wifimon_main.py config.yaml     # then open http://127.0.0.1:8000
+python FLDSMDFR.py config.yaml     # then open http://127.0.0.1:8000
 python -m pytest -q tests
 ```
 Run it on a machine connected to the network you want to monitor. Edit [config.yaml](config.yaml) to choose networks (`arp`, `tplink`, `dlink`, `starlink`).
@@ -33,7 +33,7 @@ In Ubuntu/WSL:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python wifimon_main.py config.yaml
+python FLDSMDFR.py config.yaml
 ```
 
 Open http://localhost:8000 in your Windows browser. Allow the first scan to finish.
@@ -54,7 +54,7 @@ custom names are associated with the network ID and MAC address.
 ## Architecture
 
 ```text
-wifimon_main.py             # launcher kept at the root
+FLDSMDFR.py                 # launcher kept at the root
 config.example.yaml         # versioned configuration template
 config.yaml                 # private configuration, unchanged
 wifi-monitor.db             # private saved devices and names, unchanged
@@ -74,13 +74,44 @@ After an update, stop the old app with Ctrl+C and restart using the same launche
 
 ```bash
 source .venv/bin/activate
-python wifimon_main.py
+python FLDSMDFR.py
 python -m pytest -q tests
 ```
 
+## Manufacturer and device identification
+
+Download the public IEEE OUI registry once, inside the virtual environment:
+
+```bash
+python -m wifi_monitor.services.enrichment --update-oui
+```
+
+The download stores `data/oui.txt` locally (excluded from Git). Restart the app
+to load it. No MAC, IP, hostname or saved name is sent to IEEE: only the public
+registry is downloaded. Scans and lookups then work offline. Without the file,
+the app logs a warning and uses the smaller built-in table. Download or parsing
+errors are reported explicitly; a failed update preserves the existing file.
+
+Device type is an estimate. Rules distinguish TVs, streaming devices, phones,
+tablets, PCs, printers, consoles, routers, cameras, speakers and smart-home
+devices. Saved names take precedence over hostnames when they contain a known
+device identifier; manufacturer rules are a fallback. For example:
+
+- `Samsung S24` / `Samsung A36`: Phone
+- `Samsung TV sala` / `LG webOS`: TV
+- `Galaxy Tab`: Tablet
+- `Chromecast` / `Fire TV`: Streaming device
+- `PC HP` / `PC MSI`: Computer
+- `Leidy Router` / `D-Link router`: Network gear
+
+Existing names are not modified. Renaming a device updates its estimated type
+on the next dashboard refresh, including offline devices. The vendor remains
+the network-interface manufacturer: Intel does not prove that a PC is HP or MSI.
+Samsung's vendor name alone does not distinguish a phone from a TV. Exact
+models are not inferred from a MAC. Locally administered/private MACs have no
+reliable vendor and remain of unknown type unless a name or hostname gives a hint.
+
 ## Notes
-- Device type is a guess from vendor/hostname; phones with private (randomized) MACs show as such.
 - TP-Link/D-Link read the router client page with Basic auth; paths vary by firmware (set `options.client_list_urls`). They fall back to the ARP scan.
 - Starlink's router has no open client list, so it uses the ARP scan.
 - The first scan of a network is a baseline and raises no alerts.
-- Extend the vendor table with `wifi_monitor.services.enrichment.load_oui_file()` using the IEEE `oui.txt`.
