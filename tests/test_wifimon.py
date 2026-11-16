@@ -251,3 +251,11 @@ def test_scan_preserves_saved_names_and_estimates_type_from_them(monkeypatch):
         assert not scanner.errors
     finally:
         storage.conn.close()
+
+
+def test_parse_oui_accepts_wireshark_manuf_format():
+    entries = enrichment.parse_oui(
+        "# comment\n00:00:01         \tXerox       \tXerox Corporation\n"
+        "00:55:DA:00/28   \tShinko\tShinko Technos\n"
+    )
+    assert entries == {"00:00:01": "Xerox Corporation"}

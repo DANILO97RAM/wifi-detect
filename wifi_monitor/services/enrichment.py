@@ -11,6 +11,7 @@ from urllib.request import urlopen
 from wifi_monitor.core.models import Device, normalize_mac
 
 OUI_URL = "https://standards-oui.ieee.org/oui/oui.txt"
+OUI_MIRROR_URL = "https://www.wireshark.org/download/automated/data/manuf"
 DEFAULT_OUI_FILE = Path(__file__).resolve().parents[2] / "data" / "oui.txt"
 
 # Small built-in OUI sample; extend or load a full IEEE oui.txt via load_oui_file().
@@ -86,6 +87,12 @@ def parse_oui(text: str) -> dict[str, str]:
             text, re.MULTILINE,
         )
     }
+    # Wireshark "manuf" format: "AA:BB:CC<TAB>Short<TAB>Long name" (24-bit entries only)
+    for prefix, short, long_name in re.findall(
+        r"^([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){2})[ \t]+(\S+)(?:[ \t]+([^\r\n]+))?$",
+        text, re.MULTILINE,
+    ):
+        entries.setdefault(normalize_mac(prefix), (long_name or short).strip())
     if not entries:
         raise ValueError("The OUI file contains no valid IEEE manufacturer entries")
     return entries
@@ -108,8 +115,16 @@ def _load_default_oui() -> None:
 
 
 def update_oui_file() -> int:
-    with urlopen(OUI_URL, timeout=60) as response:
-        text = response.read().decode("utf-8-sig")
+    text = ""
+    for url in (OUI_URL, OUI_MIRROR_URL):
+        try:
+            with urlopen(url, timeout=60) as response:
+                text = response.read().decode("utf-8-sig")
+            break
+        except OSError as error:
+            logging.getLogger("wifimon").warning("Could not download %s: %s", url, error)
+    if not text:
+        raise URLError("No registry source is reachable")
     entries = parse_oui(text)
     DEFAULT_OUI_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
